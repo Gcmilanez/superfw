@@ -76,6 +76,14 @@ set_clear_mutex:
   pop {r0, pc}
 
 
+// Calls crc16_nibble_512_nolut8bit for C code. It is a long_call function,
+// and calling it from C would need a GOT entry, which this payload can't have.
+.global sd_block_crc16
+.type sd_block_crc16,function
+sd_block_crc16:
+  b crc16_nibble_512_nolut8bit
+
+
 // Necessary handlers for the SC driver, reads info from SRAM.
 .global sc_issdhc
 sc_issdhc:
