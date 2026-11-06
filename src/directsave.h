@@ -33,6 +33,9 @@
 #define DIRSAV_CFG_ISSDHC_OFF          22
 #define DIRSAV_CFG_MUTEX_OFF           23
 
+#define DIRSAV_CACHE_META_OFF          0xFF00
+#define DIRSAV_CACHE_META_SIZE         32
+
 #ifndef __ASSEMBLER__
 
 #include <stddef.h>

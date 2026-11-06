@@ -53,6 +53,7 @@ uint16_t sc_rca();
 
 unsigned sdcard_read_blocks(uint8_t *buffer, uint32_t blocknum, unsigned blkcnt);
 unsigned sdcard_write_blocks(const uint8_t *buffer, uint32_t blocknum, unsigned blkcnt);
+unsigned sdcard_read_block_verified(uint8_t *buffer, uint32_t blocknum);
 
 #define SD_ERR_NO_STARTUP       1
 #define SD_ERR_BAD_IDENT        2

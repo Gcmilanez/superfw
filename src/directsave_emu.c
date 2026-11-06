@@ -22,7 +22,9 @@
 #include "directsave.h"
 #include "supercard_driver.h"
 
-#define SRAM_BASE            0x0E000000
+#ifndef SRAM_BASE
+  #define SRAM_BASE          0x0E000000
+#endif
 
 uint32_t base_sector(void);
 uint32_t get_memory_size(void);
@@ -38,7 +40,7 @@ bool validate_config() {
     uint8_t bytes[0];
     uint32_t words[0];
   } u;
-  volatile uint8_t *sramcfg = (uint8_t*)(0x0F000000 - sizeof(t_dirsave_config));
+  volatile uint8_t *sramcfg = (uint8_t*)(SRAM_BASE + 0x10000 - sizeof(t_dirsave_config));
 
   for (unsigned i = 0; i < sizeof(t_dirsave_config); i++)
     u.bytes[i] = sramcfg[i];
@@ -106,77 +108,142 @@ int ds_write_eeprom(uint32_t block_num, const uint8_t *buf) {
 // reads are usually not very efficient. Writes are easy, since we always
 // write full 4KiB blocks. Except for byte writes, more on that later :)
 // The SRAM is used as scratch/buffer. The first 32KiB are a scratch buffer,
-// the last few bytes, store the DirSav config. We also have a cache for
-// the byte-write case. This cache is created and destroyed as needed.
+// the last few bytes, store the DirSav config. We also have a cache for 
+// Byte-write cache : reading a block back from the SD card
+// right after writing it can return shifted data on real hardware, so recently
+// erased/written sectors are kept in SRAM (0x8000-0xEFFF) and byte writes are
+// written through to the SD card without reading it.
 
-#define FLASH_CACHE_MAGIC    0xCAC4ED67
+#define FLASH_CACHE_MAGIC    0xCAC4ED68
 
-#define SRAM_CACHE_DATA      0x0E00F000
-#define SRAM_CACHE_METADATA  0x0E00FF00
+#define SRAM_CACHE_DATA      (SRAM_BASE + 0x8000)   // 7 sectors (28KiB) of cached data
+#define SRAM_CACHE_METADATA  (SRAM_BASE + DIRSAV_CACHE_META_OFF)
+#define CACHE_SLOTS          7     // Pokemon touches 5 sectors per link/frontier save
+#define NO_SECTOR            0xFF  // Marks an unused cache slot
+#define NO_ADDR              0xFFFFFFFFU  // last_addr value when no byte was written yet
 
-typedef struct {
-  uint32_t magic;      // Cache magic number
-  uint32_t last_addr;  // Last flash addr accessed by the WriteByte function.
-  uint32_t dirty;      // Whether the cache holds dirty data.
-  uint32_t checksum;   // XOR checksum of this structure.
+// Cache metadata, stored in SRAM (accessed byte by byte, since SRAM is 8 bit).
+typedef union {
+  struct {
+    uint32_t magic;            // Cache magic number
+    uint32_t last_addr;        // Last flash addr written by the WriteByte function.
+    uint32_t dirty;            // Whether the block holding last_addr is not yet on the SD card.
+    uint8_t sector[CACHE_SLOTS];  // Flash sector number held by each slot (or NO_SECTOR)
+    uint8_t valid[CACHE_SLOTS];   // Bitmask of the 512 byte blocks (of 8) that hold valid data
+    uint8_t victim;            // Next slot to replace (round robin)
+    uint8_t unused;
+    uint32_t checksum;         // XOR checksum of this structure.
+  };
+  uint32_t words[DIRSAV_CACHE_META_SIZE / 4];
+  uint8_t bytes[DIRSAV_CACHE_META_SIZE];
 } t_cache_meta;
 
+_Static_assert(sizeof(t_cache_meta) == DIRSAV_CACHE_META_SIZE, "t_cache_meta size mismatch");
+_Static_assert(0x8000 + CACHE_SLOTS * 4096 <= DIRSAV_CACHE_META_OFF, "flash cache overlaps its metadata");
+
+static uint32_t cache_checksum(const t_cache_meta *cache) {
+  uint32_t res = 0;
+  for (unsigned i = 0; i < DIRSAV_CACHE_META_SIZE / 4 - 1; i++)
+    res ^= cache->words[i];
+  return res;
+}
+
+// Drops all cached data. Callers must flush the dirty block first.
+static void empty_cache(t_cache_meta *cache) {
+  cache->last_addr = NO_ADDR;
+  cache->dirty = 0;
+  for (unsigned i = 0; i < CACHE_SLOTS; i++) {
+    cache->sector[i] = NO_SECTOR;
+    cache->valid[i] = 0;
+  }
+  cache->victim = 0;
+  cache->unused = 0;
+}
+
 // Load the cache from SRAM, check that the struct is valid.
-bool load_cache_metadata(t_cache_meta *cache) {
-  // Load the medata block first, byte for byte.
-  volatile char * metablk = (char*)0x0E00FF00;
-  char *cache_bytes = (char*)cache;
+// Invalid/corrupted metadata results in an empty cache (data is read from SD).
+static void load_cache_metadata(t_cache_meta *cache) {
+  volatile uint8_t *metablk = (uint8_t*)SRAM_CACHE_METADATA;
   for (unsigned i = 0; i < sizeof(t_cache_meta); i++)
-    cache_bytes[i] = metablk[i];
+    cache->bytes[i] = metablk[i];
 
-  // Now proceed to read the local structure and validate it.
-  if (cache->magic != FLASH_CACHE_MAGIC)
-    return false;
-
-  uint32_t res = cache->magic ^
-                 cache->last_addr ^
-                 cache->dirty ^
-                 cache->checksum;
-  return res == 0;
+  if (cache->magic != FLASH_CACHE_MAGIC || cache->checksum != cache_checksum(cache))
+    empty_cache(cache);
 }
 
 // Writes the metadata back into SRAM.
 static void save_cache_metadata(t_cache_meta *cache) {
-  // Fill any housekeeping fields before writing.
   cache->magic = FLASH_CACHE_MAGIC;
-  cache->checksum = cache->magic ^
-                    cache->last_addr ^
-                    cache->dirty;
+  cache->checksum = cache_checksum(cache);
 
-  volatile char * metablk = (char*)0x0E00FF00;
-  volatile char *cache_bytes = (char*)cache;
+  volatile uint8_t *metablk = (uint8_t*)SRAM_CACHE_METADATA;
   for (unsigned i = 0; i < sizeof(t_cache_meta); i++)
-    metablk[i] = cache_bytes[i];
+    metablk[i] = cache->bytes[i];
 }
 
-// Clear cache metadata (make it invalid)
-static void wipe_cache() {
-  volatile char * metablk = (char*)0x0E00FF00;
-  for (unsigned i = 0; i < sizeof(t_cache_meta); i++)
-    metablk[i] = 0xFF;
+// Returns the SRAM address of the 512 byte block containing flash address addr.
+static uint8_t *cached_block(unsigned slot, uint32_t addr) {
+  return (uint8_t*)(SRAM_CACHE_DATA + slot * 4096U + (addr & 4095U & ~511U));
 }
 
-// Flushes the flash cache data to the specified sector
-static void flush_flash_cache(uint32_t blknum) {
-  const uint8_t * datablk = (uint8_t*)SRAM_CACHE_DATA;
-  sdcard_write_blocks(datablk, blknum, 1);
+// Returns the slot holding the flash sector, or -1 if it is not cached.
+static int find_slot(const t_cache_meta *cache, uint32_t sectnum) {
+  for (unsigned i = 0; i < CACHE_SLOTS; i++)
+    if (cache->sector[i] == sectnum)
+      return i;
+  return -1;
 }
 
-// Flushes the flash cache if necessary (when present and dirty)
-static void evict_flush_flash_cache() {
-  t_cache_meta cacheinfo;
-  if (load_cache_metadata(&cacheinfo)) {
-    // Check if we have some data we need to flush.
-    if (cacheinfo.dirty)
-      flush_flash_cache(base_sector() + cacheinfo.last_addr / 512U);
-    // Now we can just wipe the cache.
-    wipe_cache();
+// Drops the cached copy of a sector (if any).
+static void forget_sector(t_cache_meta *cache, uint32_t sectnum) {
+  const int slot = find_slot(cache, sectnum);
+  if (slot >= 0) {
+    cache->sector[slot] = NO_SECTOR;
+    cache->valid[slot] = 0;
   }
+}
+
+// Returns the slot for a sector, replacing the oldest one if it is not cached.
+// The replaced slot is never dirty, since callers flush the dirty block first.
+static unsigned claim_slot(t_cache_meta *cache, uint32_t sectnum) {
+  const int found = find_slot(cache, sectnum);
+  if (found >= 0)
+    return found;
+
+  const unsigned slot = cache->victim;
+  cache->victim = (slot + 1) % CACHE_SLOTS;
+  cache->sector[slot] = sectnum;
+  cache->valid[slot] = 0;
+  return slot;
+}
+
+// Writes the pending (dirty) block to the SD card, if any.
+// On a write error the block stays dirty, so that it is retried later. Callers
+// must then abort, since a dirty slot must never be replaced.
+static unsigned flush_dirty_block(t_cache_meta *cache) {
+  if (!cache->dirty)
+    return 0;
+
+  const int slot = find_slot(cache, cache->last_addr / 4096U);
+  if (slot < 0) {
+    cache->dirty = 0;   // Should not happen: the data is gone, report it.
+    return SD_ERR_BADWRITE;
+  }
+  if (sdcard_write_blocks(cached_block(slot, cache->last_addr), base_sector() + cache->last_addr / 512U, 1))
+    return SD_ERR_BADWRITE;
+
+  cache->dirty = 0;
+  return 0;
+}
+
+// Writes the pending block (if any) to the SD card, so that the SD card holds
+// the latest data. The cache stays valid, since its content matches the card.
+static int flush_pending_block() {
+  t_cache_meta cacheinfo;
+  load_cache_metadata(&cacheinfo);
+  const unsigned errs = flush_dirty_block(&cacheinfo);
+  save_cache_metadata(&cacheinfo);
+  return errs ? -1 : 0;
 }
 
 // Reads flash bytes (directly from SD card) into a user-defined buffer.
@@ -185,7 +252,8 @@ int ds_read_flash(uint8_t *buf, uint32_t offset, uint32_t bytecount) {
   if (!validate_config())
     return -1;
 
-  evict_flush_flash_cache();  // Flush any cached data (usually does nothing)
+  if (flush_pending_block())
+    return -1;
 
   const uint32_t msize = get_memory_size();
   if (offset > msize || bytecount > msize || offset + bytecount > msize)
@@ -196,7 +264,7 @@ int ds_read_flash(uint8_t *buf, uint32_t offset, uint32_t bytecount) {
   // 64 blocks in one go.
   const uint32_t basen = base_sector();
 
-  uint8_t *tmpbuf = (uint8_t*)0x0E000000;
+  uint8_t *tmpbuf = (uint8_t*)SRAM_BASE;
   while (bytecount) {
     uint32_t start_blk = offset / 512U;
     uint32_t end_blk = (offset + bytecount - 1U) / 512U;
@@ -229,11 +297,16 @@ int ds_write_sector_flash(const uint8_t *buf, uint32_t sectnum) {
 
   if (!validate_config())
     return -1;
-
-  evict_flush_flash_cache();  // Flush any cached data (usually does nothing)
-
   if (sectnum * 4096 >= get_memory_size())
     return -1;
+
+  // Flush any pending data and drop the cached copy of this sector (only).
+  t_cache_meta cacheinfo;
+  load_cache_metadata(&cacheinfo);
+  if (flush_dirty_block(&cacheinfo))
+    return -1;
+  forget_sector(&cacheinfo, sectnum);
+  save_cache_metadata(&cacheinfo);
 
   if (sdcard_write_blocks(buf, base_sector() + sectnum * blpersector, blpersector))
     return -1;
@@ -247,10 +320,14 @@ int ds_erase_chip_flash(void) {
   if (!validate_config())
     return -1;
 
-  evict_flush_flash_cache();  // Flush any cached data (usually does nothing)
+  // Everything is about to be erased, pending data included: drop the cache.
+  t_cache_meta cacheinfo;
+  load_cache_metadata(&cacheinfo);
+  empty_cache(&cacheinfo);
+  save_cache_metadata(&cacheinfo);
 
   // Clear buffer and write that to the SD card
-  uint8_t *tmpbuf = (uint8_t*)0x0E000000;
+  uint8_t *tmpbuf = (uint8_t*)SRAM_BASE;
   for (unsigned i = 0; i < blrun*512; i++)
     tmpbuf[i] = 0xff;
 
@@ -269,21 +346,26 @@ int ds_erase_sector_flash(uint32_t sectnum) {
 
   if (!validate_config())
     return -1;
-
-  evict_flush_flash_cache();  // Flush any cached data (usually does nothing)
-
   if (sectnum * 4096 >= get_memory_size())
     return -1;
 
-  // Clear buffer and write that to the SD card
-  uint8_t *tmpbuf = (uint8_t*)0x0E000000;
+  t_cache_meta cacheinfo;
+  load_cache_metadata(&cacheinfo);
+  if (flush_dirty_block(&cacheinfo))
+    return -1;
+
+  // Use the sector's cache slot as the 0xFF buffer: after erasing, the cached
+  // copy is valid and later byte writes to this sector need no SD reads.
+  const unsigned slot = claim_slot(&cacheinfo, sectnum);
+  uint8_t *sectdata = cached_block(slot, 0);
   for (unsigned i = 0; i < 4096; i++)
-    tmpbuf[i] = 0xff;
+    sectdata[i] = 0xff;
 
-  if (sdcard_write_blocks(tmpbuf, base_sector() + sectnum * blpersector, blpersector))
-      return -1;
+  const bool erased = !sdcard_write_blocks(sectdata, base_sector() + sectnum * blpersector, blpersector);
+  cacheinfo.valid[slot] = erased ? 0xFF : 0;   // All 8 blocks are valid after erasing
+  save_cache_metadata(&cacheinfo);
 
-  return 0;
+  return erased ? 0 : -1;
 }
 
 // Writes a single byte to flash. This routine is not used by most games.
@@ -294,51 +376,48 @@ int ds_write_byte_flash(uint32_t offset, uint8_t value) {
   if (offset >= get_memory_size())
     return -1;
 
-  unsigned errs = 0;
-  uint8_t *datablk = (uint8_t*)SRAM_CACHE_DATA;
   const uint32_t blkn = offset / 512U;
-  const uint32_t basesect = base_sector();
+  const unsigned blkbit = 1U << (blkn % 8);
 
   t_cache_meta cacheinfo;
-  if (!load_cache_metadata(&cacheinfo)) {
-    // No cache was found, create a new cache with some sensible values.
-    cacheinfo.last_addr = offset;
-    cacheinfo.dirty = 0;  // We will flush this one, so clean.
+  load_cache_metadata(&cacheinfo);
 
-    // Read data for that 512 byte block and patch written byte.
-    errs |= sdcard_read_blocks(datablk, basesect + blkn, 1);
-    datablk[offset % 512U] = value;
-    errs |= sdcard_write_blocks(datablk, basesect + blkn, 1);
-  } else {
-    // We usually flush when:
-    //  - The write happens the end of the 512 byte block.
-    //  - The write is non-sequential.
-    //  - The write goes to another block (aka, if we need to evict a dirty block).
+  // Moving to another block: write back the pending one first.
+  if (cacheinfo.last_addr / 512U != blkn && flush_dirty_block(&cacheinfo))
+    return -1;
 
-    // Write back any dirty block if we are gonna replace it.
-    const uint32_t cacheblkn = cacheinfo.last_addr / 512U;
-    if (blkn != cacheblkn) {
-      if (cacheinfo.dirty)
-        errs |= sdcard_write_blocks(datablk, basesect + cacheblkn, 1);
-      errs |= sdcard_read_blocks(datablk, basesect + blkn, 1);
+  // Only read from the SD card if this block is not cached (ie. the sector
+  // was not erased/written in this session). The read is CRC checked, so a
+  // bad read results in an error (the game reports it) instead of corruption.
+  // It goes to the scratch area first, so a failed read evicts nothing.
+  int slot = find_slot(&cacheinfo, offset / 4096U);
+  if (slot < 0 || !(cacheinfo.valid[slot] & blkbit)) {
+    uint8_t *readbuf = (uint8_t*)SRAM_BASE;
+    if (sdcard_read_block_verified(readbuf, base_sector() + blkn)) {
+      save_cache_metadata(&cacheinfo);
+      return -1;
     }
 
-    datablk[offset % 512U] = value;
-    cacheinfo.dirty = 1;
-
-    // Is this the end of the block, or was this non-sequential?
-    if ((offset % 512U) == 512 - 1 || cacheinfo.last_addr + 1 != offset) {
-      errs |= sdcard_write_blocks(datablk, basesect + blkn, 1);
-      cacheinfo.dirty = 0;
-    }
-
-    cacheinfo.last_addr = offset;
+    slot = claim_slot(&cacheinfo, offset / 4096U);
+    uint8_t *blkdata = cached_block(slot, offset);
+    for (unsigned i = 0; i < 512; i++)
+      blkdata[i] = readbuf[i];
+    cacheinfo.valid[slot] |= blkbit;
   }
 
-  // We now fill the cache metadata to SRAM
+  // Patch the byte in the cached block, it is flushed below or on the next call.
+  cached_block(slot, offset)[offset % 512U] = value;
+  const bool sequential = cacheinfo.last_addr != NO_ADDR && cacheinfo.last_addr + 1 == offset;
+  cacheinfo.last_addr = offset;
+  cacheinfo.dirty = 1;
+
+  // Is this the end of the block, or was this non-sequential?
+  unsigned errs = 0;
+  if ((offset % 512U) == 512 - 1 || !sequential)
+    errs = flush_dirty_block(&cacheinfo);
+
   save_cache_metadata(&cacheinfo);
 
   return errs ? -1 : 0;
 }
-
 

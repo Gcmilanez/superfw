@@ -189,6 +189,12 @@ void load_directsave_config(const t_dirsave_info *dsinfo) {
   cfg.checksum = checksum;
 
   write_sram_buffer((uint8_t*)(&cfg), 64*1024 - sizeof(cfg), sizeof(cfg));
+
+  // Invalidate the DirectSave flash cache: it might belong to another game,
+  // or the save file might have been modified since the last session.
+  uint32_t nocache[DIRSAV_CACHE_META_SIZE / 4];
+  memset32(nocache, ~0U, sizeof(nocache));
+  write_sram_buffer((uint8_t*)nocache, DIRSAV_CACHE_META_OFF, sizeof(nocache));
 }
 
 void load_rtcclock_data(const t_rtc_info *rtcinfo) {
