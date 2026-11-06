@@ -445,6 +445,7 @@ unsigned sdcard_read_blocks(uint8_t *buffer, uint32_t blocknum, unsigned blkcnt)
 
 #ifdef SD_READ_VERIFY
 int sc_read_sectors_crc_w0(uint8_t *buffer, unsigned count, unsigned timeout, uint8_t *crcbuf);
+void sd_block_crc16(const uint8_t *buffer, uint8_t *crcout);
 
 static bool same_crc(const uint8_t *a, const uint8_t *b) {
   for (unsigned i = 0; i < 8; i++)
@@ -471,7 +472,7 @@ unsigned sdcard_read_block_verified(uint8_t *buffer, uint32_t blocknum) {
 
     if (rd_ok) {
       uint8_t expected_crc[8];
-      crc16_nibble_512_nolut8bit(buffer, expected_crc);
+      sd_block_crc16(buffer, expected_crc);
       if (same_crc(received_crc, expected_crc))
         return 0;
     }
