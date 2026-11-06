@@ -95,7 +95,7 @@ DLDI_CFLAGS=-Os -ggdb \
 
 DIRECTSAVE_CFLAGS=-Os -ggdb \
                  $(BASEFLAGS) -DSDDRV_TIMEOUT_MULT=16 \
-                 -DNO_SUPERCARD_INIT \
+                 -DNO_SUPERCARD_INIT -DSD_READ_VERIFY \
                  -Wall -Isrc -I. \
                  -marm -flto -fPIC
 

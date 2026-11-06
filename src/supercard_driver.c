@@ -78,6 +78,7 @@ void send_sdcard_commandbuf(const uint8_t *buffer, unsigned maxsize);
 #define MODESWITCH_MAGIC         0xA55A
 
 #define MAX_WRITE_RETRIES        2            // Try up to 3 times to write a block.
+#define MAX_READ_RETRIES         2
 #define MAX_REINIT_RETRIES       9            // Try up to 10 to re-init the card.
 
 #define WAIT_IDLE_TIMEOUT    (0x800000 / SDDRV_TIMEOUT_MULT)   // Number of iterations to wait for card ready
@@ -445,6 +446,44 @@ unsigned sdcard_read_blocks(uint8_t *buffer, uint32_t blocknum, unsigned blkcnt)
 
   return ret;
 }
+
+#ifdef SD_READ_VERIFY
+int sc_read_sectors_crc_w0(uint8_t *buffer, unsigned count, unsigned timeout, uint8_t *crcbuf);
+
+static bool same_crc(const uint8_t *a, const uint8_t *b) {
+  for (unsigned i = 0; i < 8; i++)
+    if (a[i] != b[i])
+      return false;
+  return true;
+}
+
+// Reads a single block and checks its CRC, retrying on mismatch.
+// Reads issued shortly after a write have been observed to return shifted
+// data (the start bit is missed), so DirectSave must not trust unchecked reads
+// when it writes the data back.
+unsigned sdcard_read_block_verified(uint8_t *buffer, uint32_t blocknum) {
+  for (unsigned j = 0; j < 1 + MAX_READ_RETRIES; j++) {
+    uint8_t resp[4];
+    if (!send_sdcard_command_noclock(SD_CMD18, sc_issdhc() ? blocknum : blocknum * 512, resp, sizeof(resp)))
+      return SD_ERR_BADREAD;
+
+    uint8_t received_crc[8];
+    const bool rd_ok = !sc_read_sectors_crc_w0(buffer, 1, WAIT_DATA_TIMEOUT, received_crc);
+
+    if (!send_sdcard_command(SD_CMD12, 0, NULL, SD_MAX_RESP))
+      return SD_ERR_BADREAD;
+
+    if (rd_ok) {
+      uint8_t expected_crc[8];
+      crc16_nibble_512_nolut8bit(buffer, expected_crc);
+      if (same_crc(received_crc, expected_crc))
+        return 0;
+    }
+  }
+
+  return SD_ERR_BADREAD;
+}
+#endif
 
 unsigned sdcard_write_blocks(const uint8_t *buffer, uint32_t blocknum, unsigned blkcnt) {
   // Send a write intent / clear command, for faster writes. Do not take errors

@@ -142,10 +142,16 @@ get_memory_size:
 // r0: output byte buffer (output)
 // r1: number of blocks to read
 // r2: number of timeout iterations
+// r3: CRC output buffer (8 bytes per block), or null to discard it.
 .global sc_read_sectors_w0
 .type sc_read_sectors_w0,function
 sc_read_sectors_w0:
-  push {r2, r4-r12, lr}
+  mov r3, $0
+
+.global sc_read_sectors_crc_w0
+.type sc_read_sectors_crc_w0,function
+sc_read_sectors_crc_w0:
+  push {r2, r3, r4-r12, lr}
   ldr r7, =(0x04000000 + REG_IME)
   ldr r8, =0x09FFFFFE
   ldr r9, =0xA55A
@@ -190,9 +196,24 @@ sc_read_sectors_w0:
       subs r4, r4, $1
       bne 2b
 
-    // Skip 8 bytes
-    bl sd_ldm4
-    bl sd_ldm4
+    // Read the 8 CRC bytes, storing them if a CRC buffer was provided.
+    // r10 is clobbered by sd_ldm4, so the pointer lives on the stack (r3 slot).
+    .rept 2
+      bl sd_ldm4
+      ldr r10, [sp, #(STACK_IRESV + 4)]
+      cmp r10, $0
+      beq 4f
+      lsr  r2,  r2, #24
+      lsr  r3,  r3, #24
+      lsr  r6,  r6, #24
+      lsr r12, r12, #24
+      strb r2, [r10], #1
+      strb r3, [r10], #1
+      strb r6, [r10], #1
+      strb r12, [r10], #1
+      str r10, [sp, #(STACK_IRESV + 4)]
+    4:
+    .endr
 
     bl sd_ldrh            // Final clock: should go all high (0xF)
 
@@ -201,7 +222,7 @@ sc_read_sectors_w0:
 
   mov r0, $0            // Return value: success
 3:
-  add sp, $(STACK_IRESV + 4)     // Skip r2 pushed on the stack
+  add sp, $(STACK_IRESV + 8)     // Skip r2/r3 pushed on the stack
   pop {r4-r12, lr}
   bx lr
 
