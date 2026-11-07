@@ -22,7 +22,9 @@
 #include "directsave.h"
 #include "supercard_driver.h"
 
-#define SRAM_BASE            0x0E000000
+#ifndef SRAM_BASE
+  #define SRAM_BASE          0x0E000000
+#endif
 
 uint32_t base_sector(void);
 uint32_t get_memory_size(void);
@@ -38,7 +40,7 @@ bool validate_config() {
     uint8_t bytes[0];
     uint32_t words[0];
   } u;
-  volatile uint8_t *sramcfg = (uint8_t*)(0x0F000000 - sizeof(t_dirsave_config));
+  volatile uint8_t *sramcfg = (uint8_t*)(SRAM_BASE + 0x10000 - sizeof(t_dirsave_config));
 
   for (unsigned i = 0; i < sizeof(t_dirsave_config); i++)
     u.bytes[i] = sramcfg[i];
@@ -114,8 +116,8 @@ int ds_write_eeprom(uint32_t block_num, const uint8_t *buf) {
 
 #define FLASH_CACHE_MAGIC    0xCAC4ED68
 
-#define SRAM_CACHE_DATA      0x0E008000   // 7 sectors (28KiB) of cached data
-#define SRAM_CACHE_METADATA  (0x0E000000 + DIRSAV_CACHE_META_OFF)
+#define SRAM_CACHE_DATA      (SRAM_BASE + 0x8000)   // 7 sectors (28KiB) of cached data
+#define SRAM_CACHE_METADATA  (SRAM_BASE + DIRSAV_CACHE_META_OFF)
 #define CACHE_SLOTS          7     // Pokemon touches 5 sectors per link/frontier save
 #define NO_SECTOR            0xFF  // Marks an unused cache slot
 #define NO_ADDR              0xFFFFFFFFU  // last_addr value when no byte was written yet
@@ -265,7 +267,7 @@ int ds_read_flash(uint8_t *buf, uint32_t offset, uint32_t bytecount) {
   // 64 blocks in one go.
   const uint32_t basen = base_sector();
 
-  uint8_t *tmpbuf = (uint8_t*)0x0E000000;
+  uint8_t *tmpbuf = (uint8_t*)SRAM_BASE;
   while (bytecount) {
     uint32_t start_blk = offset / 512U;
     uint32_t end_blk = (offset + bytecount - 1U) / 512U;
@@ -328,7 +330,7 @@ int ds_erase_chip_flash(void) {
   save_cache_metadata(&cacheinfo);
 
   // Clear buffer and write that to the SD card
-  uint8_t *tmpbuf = (uint8_t*)0x0E000000;
+  uint8_t *tmpbuf = (uint8_t*)SRAM_BASE;
   for (unsigned i = 0; i < blrun*512; i++)
     tmpbuf[i] = 0xff;
 
@@ -393,7 +395,7 @@ int ds_write_byte_flash(uint32_t offset, uint8_t value) {
   // It goes to the scratch area first, so a failed read evicts nothing.
   int slot = find_slot(&cacheinfo, offset / 4096U);
   if (slot < 0 || !(cacheinfo.valid[slot] & blkbit)) {
-    uint8_t *readbuf = (uint8_t*)0x0E000000;
+    uint8_t *readbuf = (uint8_t*)SRAM_BASE;
     if (sdcard_read_block_verified(readbuf, base_sector() + blkn)) {
       save_cache_metadata(&cacheinfo);
       return -1;
